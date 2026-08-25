@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import sys
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -16,6 +17,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+EPISODE_EMOJI = "<:emoji_name:emoji_id>"
 
 OVERLAY_FILENAME = "overlay.png"
 
@@ -57,6 +60,12 @@ bot = ParodyBot()
 
 @bot.event
 async def on_ready():
+    activity = discord.Game(name="made with Python!")
+    
+
+    await bot.change_presence(status=discord.Status.online, activity=activity)
+
+
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
 async def generate_tts_audio(text: str, voice: str) -> io.BytesIO:
@@ -67,6 +76,32 @@ async def generate_tts_audio(text: str, voice: str) -> io.BytesIO:
             audio_data.write(chunk["data"])
     audio_data.seek(0)
     return audio_data
+
+@bot.tree.command(name="restart", description="Restart the bot (Bot owner only).")
+async def restart(interaction: discord.Interaction):
+    app_info = await bot.application_info()
+    if interaction.user.id != app_info.owner.id:
+        await interaction.response.send_message(
+            "Only the bot owner can use this command.", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message("Restarting bot...", ephemeral=True)
+    await bot.close()
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+@bot.tree.command(name="shutdown", description="Shutdown the bot (Bot owner only).")
+async def shutdown(interaction: discord.Interaction):
+    app_info = await bot.application_info()
+    if interaction.user.id != app_info.owner.id:
+        await interaction.response.send_message(
+            "Only the bot owner can use this command.", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message("Shutting down bot...", ephemeral=True)
+    await bot.close()
+    sys.exit(0)
 
 @bot.tree.command(name="episode", description="Generate an AI parody episode.")
 @app_commands.describe(
@@ -87,7 +122,7 @@ async def generate_tts_audio(text: str, voice: str) -> io.BytesIO:
 async def episode(
     interaction: discord.Interaction,
     topic: str,
-    turns: app_commands.Range[int, 3, 15] = 6,
+    turns: app_commands.Range[int, 3, 10] = 6,
     model: app_commands.Choice[str] = None,
     tts: bool = False,
 ):
@@ -98,6 +133,7 @@ async def episode(
         return
 
     await interaction.response.defer()
+    await interaction.edit_original_response(content="Generating episode script... [10%]")
 
     chosen_model = model.value if model else "gemini-3.5-flash-lite"
 
@@ -133,6 +169,7 @@ async def episode(
     ]
 
     try:
+        await interaction.edit_original_response(content="Requesting script from Gemini... [30%]")
         response = gemini_client.models.generate_content(
             model=chosen_model,
             contents=script_prompt,
@@ -144,7 +181,7 @@ async def episode(
 
         if not response.text:
             await interaction.followup.send(
-                "⚠️ Content blocked or empty response due to safety filters."
+                "Content blocked or empty response due to safety filters."
             )
             return
 
@@ -153,27 +190,29 @@ async def episode(
         await interaction.followup.send(f"Failed to generate script ({chosen_model}): {e}")
         return
 
+    await interaction.edit_original_response(content="Formatting script embeds... [60%]")
+
     embeds = []
     files = []
+    
+    # Custom Emoji Header Embed
     header_embed = discord.Embed(
-        title=f"EPISODE: {topic.upper()}",
-        description=f"*A {turns}-turn parody scene starring Fred, Kevin and Evil Fred.*",
+        title=f"{EPISODE_EMOJI} EPISODE: {topic.upper()}",
+        description=f"*A {turns}-turn parody scene starring Fred, Kevin, and Evil Fred.*",
         color=discord.Color.dark_embed(),
     )
     embeds.append(header_embed)
 
+    script_lines = [l.strip() for l in raw_script.split("\n") if l.strip()]
+    total_lines = len(script_lines)
     line_count = 0
-    for line in raw_script.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
 
+    for idx, line in enumerate(script_lines):
         match = re.match(r"^([^:]+)\s*:\s*(.*)$", line)
         if match:
             speaker_key = match.group(1).strip()
             dialogue = match.group(2).strip()
 
-            # Fallback configuration if character isn't explicitly defined
             char_data = CHARACTERS.get(
                 speaker_key,
                 {
@@ -198,6 +237,8 @@ async def episode(
             # Generate TTS audio if enabled
             if tts and len(files) < 15:
                 line_count += 1
+                progress = 60 + int((idx / max(total_lines, 1)) * 30)
+                await interaction.edit_original_response(content=f"Generating audio line {line_count}/{total_lines}... [{progress}%]")
                 try:
                     audio_stream = await generate_tts_audio(dialogue, speaker_voice)
                     files.append(
@@ -213,10 +254,15 @@ async def episode(
         await interaction.followup.send("Script generation produced no dialogue.")
         return
 
+    await interaction.edit_original_response(content="Uploading episode... [95%]")
+
     if files:
         await interaction.followup.send(embeds=embeds, files=files)
     else:
         await interaction.followup.send(embeds=embeds)
+
+    # Clean up status message upon completion
+    await interaction.edit_original_response(content="Episode generation complete!")
 
 
 @bot.tree.command(
