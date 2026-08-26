@@ -128,10 +128,10 @@ async def shutdown(interaction: discord.Interaction):
 async def show_queue(interaction: discord.Interaction):
     qsize = bot.episode_queue.qsize()
     if qsize == 0:
-        await interaction.response.send_message("The episode queue is currently empty!", ephemeral=True)
+        await interaction.response.send_message("The episode queue is currently empty!")
     else:
         await interaction.response.send_message(
-            f"There are currently **{qsize}** episode(s) waiting in queue.", ephemeral=True
+            f"There are currently **{qsize}** episode(s) waiting in queue."
         )
 
 
