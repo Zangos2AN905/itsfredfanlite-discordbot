@@ -11,9 +11,6 @@ from google import genai
 from google.genai import types
 from PIL import Image, ImageSequence
 import edge_tts
-import soundfile as sf
-from pykokoro import KokoroPipeline, PipelineConfig
-from pykokoro.generation_config import GenerationConfig
 
 load_dotenv()
 
@@ -23,7 +20,6 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 EPISODE_EMOJI = "<:emoji_name:emoji_id>"
-
 OVERLAY_FILENAME = "overlay.png"
 
 CHARACTERS = {
@@ -31,22 +27,19 @@ CHARACTERS = {
         "name": "Fred Figglehorn",
         "avatar": "https://i.pinimg.com/1200x/72/60/08/726008f18672dfc798180d1185d977ae.jpg",
         "color": discord.Color.gold(),
-        "edge_voice": "en-GB-ThomasNeural",
-        "kokoro_voice": "am_adam",
+        "voice": "en-GB-ThomasNeural",
     },
     "Kevin": {
         "name": "Kevin",
         "avatar": "https://wertigo.ru/api/shared_files/b7bef8c8-99fe-415f-a1d2-de1f758445eb/files/b7bef8c8-99fe-415f-a1d2-de1f758445eb/preview",
         "color": discord.Color.blue(),
-        "edge_voice": "en-US-AndrewNeural",
-        "kokoro_voice": "am_michael",
+        "voice": "en-US-AndrewNeural",
     },
     "Angry Fred": {
         "name": "Angry Fred",
         "avatar": "https://iili.io/CtW9xWX.jpg",
         "color": discord.Color.red(),
-        "edge_voice": "en-US-ChristopherNeural",
-        "kokoro_voice": "bm_george",
+        "voice": "en-US-ChristopherNeural",
     },
 }
 
@@ -62,24 +55,25 @@ class ParodyBot(commands.Bot):
     async def setup_hook(self):
         await self.tree.sync()
         print("Slash commands synced successfully.")
+        # Start the sequential background queue for episode generation
         self.worker_task = asyncio.create_task(self.episode_queue_worker())
 
     async def episode_queue_worker(self):
-            """Episode creation requests in the background."""
-            while True:
-                task_func, interaction = await self.episode_queue.get()
+        """Processes episode creation requests sequentially in the background."""
+        while True:
+            task_func, interaction = await self.episode_queue.get()
+            try:
+                await task_func(interaction)
+            except Exception as e:
+                print(f"Error processing episode task: {e}")
                 try:
-                    await task_func(interaction)
-                except Exception as e:
-                    print(f"Error processing episode task: {e}")
-                    try:
-                        await interaction.followup.send(
-                            f"An error occurred during episode processing: {e}"
-                        )
-                    except Exception:
-                        pass
-                finally:
-                    self.episode_queue.task_done()
+                    await interaction.followup.send(
+                        f"An error occurred during episode processing: {e}"
+                    )
+                except Exception:
+                    pass
+            finally:
+                self.episode_queue.task_done()
 
 
 bot = ParodyBot()
@@ -88,14 +82,11 @@ bot = ParodyBot()
 @bot.event
 async def on_ready():
     activity = discord.Game(name="made with Python!")
-    
-
     await bot.change_presence(status=discord.Status.online, activity=activity)
-
-
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
-async def generate_edge_tts_audio(text: str, voice: str) -> io.BytesIO:
+
+async def generate_tts_audio(text: str, voice: str) -> io.BytesIO:
     communicate = edge_tts.Communicate(text, voice)
     audio_data = io.BytesIO()
     async for chunk in communicate.stream():
@@ -104,20 +95,6 @@ async def generate_edge_tts_audio(text: str, voice: str) -> io.BytesIO:
     audio_data.seek(0)
     return audio_data
 
-
-def generate_kokoro_tts_audio_sync(text: str, voice: str) -> io.BytesIO:
-    """Synchronous audio generator using pykokoro pipeline."""
-    # Temporarily override default target voice for execution pipeline
-    KokoroPipeline.config.voice = voice
-    
-    # Run pipeline generation
-    result = KokoroPipeline.run(text)
-    
-    audio_data = io.BytesIO()
-    # Write audio samples array to in-memory WAV file
-    sf.write(audio_data, result.audio, result.sample_rate, format="WAV")
-    audio_data.seek(0)
-    return audio_data
 
 @bot.tree.command(name="restart", description="Restart the bot (Bot owner only).")
 async def restart(interaction: discord.Interaction):
@@ -132,6 +109,7 @@ async def restart(interaction: discord.Interaction):
     await bot.close()
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
+
 @bot.tree.command(name="shutdown", description="Shutdown the bot (Bot owner only).")
 async def shutdown(interaction: discord.Interaction):
     app_info = await bot.application_info()
@@ -145,23 +123,24 @@ async def shutdown(interaction: discord.Interaction):
     await bot.close()
     sys.exit(0)
 
-@bot.tree.command(name="queue", description="Status of the episode queue.")
+
+@bot.tree.command(name="queue", description="Check the current status of the episode queue.")
 async def show_queue(interaction: discord.Interaction):
     qsize = bot.episode_queue.qsize()
     if qsize == 0:
-        await interaction.response.send_message("The episode queue is empty", ephemeral=True)
+        await interaction.response.send_message("The episode queue is currently empty!", ephemeral=True)
     else:
         await interaction.response.send_message(
             f"There are currently **{qsize}** episode(s) waiting in queue.", ephemeral=True
         )
-        
+
 
 async def run_episode_job(
     interaction: discord.Interaction,
     topic: str,
     turns: int,
     chosen_model: str,
-    tts_engine: str,
+    tts: bool,
 ):
     await interaction.edit_original_response(content="Generating episode script... [10%]")
 
@@ -224,7 +203,7 @@ async def run_episode_job(
 
     header_embed = discord.Embed(
         title=f"{EPISODE_EMOJI} EPISODE: {topic.upper()}",
-        description=f"*A {turns}-turn parody scene starring Fred, Kevin, and Angry Fred.*",
+        description=f"*A {turns}-turn parody scene starring Fred, Kevin, and Evil Fred.*",
         color=discord.Color.dark_embed(),
     )
     embeds.append(header_embed)
@@ -245,10 +224,11 @@ async def run_episode_job(
                     "name": speaker_key,
                     "avatar": None,
                     "color": discord.Color.light_grey(),
-                    "edge_voice": "en-GB-ThomasNeural",
-                    "kokoro_voice": "am_adam",
+                    "voice": "en-GB-ThomasNeural",
                 },
             )
+
+            speaker_voice = char_data.get("voice", "en-GB-ThomasNeural")
 
             line_embed = discord.Embed(
                 description=dialogue, color=char_data.get("color", discord.Color.light_grey())
@@ -259,27 +239,16 @@ async def run_episode_job(
             )
             embeds.append(line_embed)
 
-            # Generate audio files if configured
-            if tts_engine != "none" and len(files) < 15:
+            if tts and len(files) < 15:
                 line_count += 1
                 progress = 60 + int((idx / max(total_lines, 1)) * 30)
                 await interaction.edit_original_response(
-                    content=f"Generating {tts_engine.upper()} audio line {line_count}/{total_lines}... [{progress}%]"
+                    content=f"Generating audio line {line_count}/{total_lines}... [{progress}%]"
                 )
                 try:
-                    if tts_engine == "kokoro":
-                        voice = char_data.get("kokoro_voice", "am_adam")
-                        audio_stream = await asyncio.to_thread(
-                            generate_kokoro_tts_audio_sync, dialogue, voice
-                        )
-                        ext = "wav"
-                    else:
-                        voice = char_data.get("edge_voice", "en-GB-ThomasNeural")
-                        audio_stream = await generate_edge_tts_audio(dialogue, voice)
-                        ext = "mp3"
-
+                    audio_stream = await generate_tts_audio(dialogue, speaker_voice)
                     files.append(
-                        discord.File(audio_stream, filename=f"line_{line_count}_{speaker_key}.{ext}")
+                        discord.File(audio_stream, filename=f"line_{line_count}_{speaker_key}.mp3")
                     )
                 except Exception as tts_err:
                     print(f"TTS generation failed for line {line_count}: {tts_err}")
@@ -305,8 +274,8 @@ async def run_episode_job(
 @app_commands.describe(
     topic="The topic for the episode",
     turns="Number of dialogue turns (3 to 10)",
-    model="Choose Gemini model",
-    tts_engine="Choose TTS Provider",
+    model="choose gemini models",
+    tts="Generate audio?",
 )
 @app_commands.choices(
     model=[
@@ -315,19 +284,14 @@ async def run_episode_job(
         app_commands.Choice(name="Gemini 3.7 Flash", value="gemini-3.7-flash"),
         app_commands.Choice(name="Gemini 3.5 Flash", value="gemini-3.5-flash"),
         app_commands.Choice(name="Gemini 3.5", value="gemini-3.5-flash"),
-    ],
-    tts_engine=[
-        app_commands.Choice(name="None (Text Only)", value="none"),
-        app_commands.Choice(name="Edge TTS (Fast)", value="edge"),
-        app_commands.Choice(name="PyKokoro TTS (High Quality)", value="kokoro"),
-    ],
+    ]
 )
 async def episode(
     interaction: discord.Interaction,
     topic: str,
     turns: app_commands.Range[int, 3, 10] = 6,
     model: app_commands.Choice[str] = None,
-    tts_engine: app_commands.Choice[str] = None,
+    tts: bool = False,
 ):
     if not gemini_client:
         await interaction.response.send_message(
@@ -336,7 +300,7 @@ async def episode(
         return
 
     await interaction.response.defer()
-
+    
     queue_position = bot.episode_queue.qsize() + 1
     if queue_position > 1:
         await interaction.edit_original_response(content=f"Queued! Position in line: {queue_position - 1}")
@@ -344,10 +308,9 @@ async def episode(
         await interaction.edit_original_response(content="Starting episode generation...")
 
     chosen_model = model.value if model else "gemini-3.5-flash-lite"
-    chosen_tts = tts_engine.value if tts_engine else "none"
 
     async def job(inter):
-        await run_episode_job(inter, topic, turns, chosen_model, chosen_tts)
+        await run_episode_job(inter, topic, turns, chosen_model, tts)
 
     await bot.episode_queue.put((job, interaction))
 
@@ -397,7 +360,6 @@ async def previewtext(
 
             bg_width, bg_height = base_img.size
 
-            # Determine target canvas size
             if size_mode == "150x150":
                 target_w, target_h = 150, 150
             else:
@@ -413,8 +375,6 @@ async def previewtext(
 
                 for frame in ImageSequence.Iterator(base_img):
                     frame_rgba = frame.convert("RGBA")
-                    
-                    # Force resize base frame if target size differs
                     if (bg_width, bg_height) != (target_w, target_h):
                         frame_rgba = frame_rgba.resize(
                             (target_w, target_h), Image.Resampling.LANCZOS
@@ -440,7 +400,6 @@ async def previewtext(
                 output_filename = "preview_result.gif"
             else:
                 background = base_img.convert("RGBA")
-                
                 if (bg_width, bg_height) != (target_w, target_h):
                     background = background.resize(
                         (target_w, target_h), Image.Resampling.LANCZOS
@@ -481,8 +440,9 @@ async def version2(interaction: discord.Interaction):
 @bot.tree.command(name="helpcommand", description="List available commands.")
 async def help_command(interaction: discord.Interaction):
     help_text = (
-        "**/episode [topic] [turns] [model] [tts_engine]** - Generate an AI parody script\n"
-        "**/previewtext [image]** - adding preview text \n"
+        "**/episode [topic] [turns] [model] [tts]** - Generate an AI parody script (Queued)\n"
+        "**/queue** - Check position/length of the episode generation queue\n"
+        "**/previewtext [image]** - Add preview text overlay to an image\n"
         "**/version** - Check bot version\n"
         "**/version2** - About version 2"
     )
@@ -494,5 +454,3 @@ if __name__ == "__main__":
         print("Error: DISCORD_TOKEN or GEMINI_API_KEY is missing from .env.")
     else:
         bot.run(DISCORD_TOKEN)
-
-
