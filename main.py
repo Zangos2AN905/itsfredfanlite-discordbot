@@ -11,16 +11,20 @@ from google import genai
 from google.genai import types
 from PIL import Image, ImageSequence
 import edge_tts
+import aiohttp
 
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 EPISODE_EMOJI = "<:emoji_name:emoji_id>"
 OVERLAY_FILENAME = "overlay.png"
+
+DISABLED_MODELS = {}
 
 CHARACTERS = {
     "Fred": {
@@ -95,6 +99,58 @@ async def generate_tts_audio(text: str, voice: str) -> io.BytesIO:
     audio_data.seek(0)
     return audio_data
 
+async def request_openrouter_script(prompt: str, model_id: str) -> str:
+    """Routes script generation request to Gemini or OpenRouter."""
+    if model_id.startswith("gemini-"):
+        safety_settings = [
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+            ),
+        ]
+        response = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=model_id,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                safety_settings=safety_settings,
+                temperature=0.7,
+            ),
+        )
+        return response.text.strip() if response.text else ""
+
+    else:  # OpenRouter API
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data["choices"][0]["message"]["content"].strip()
+                else:
+                    err_body = await resp.text()
+                    raise Exception(f"OpenRouter LLM Error ({resp.status}): {err_body}")
+
 
 @bot.tree.command(name="restart", description="Restart the bot (Bot owner only).")
 async def restart(interaction: discord.Interaction):
@@ -123,6 +179,66 @@ async def shutdown(interaction: discord.Interaction):
     await bot.close()
     sys.exit(0)
 
+MODEL_CHOICES = [
+    app_commands.Choice(name="Gemini 3.1 Flash Lite (Fast, ratelimited)", value="gemini-3.1-flash-lite"),
+    app_commands.Choice(name="Gemini 3.5 Flash Lite (Lightweight)", value="gemini-3.5-flash-lite"),
+    app_commands.Choice(name="Gemini 3.7 Flash", value="gemini-3.7-flash"),
+    app_commands.Choice(name="Gemini 3.5 Flash", value="gemini-3.5-flash"),
+    app_commands.Choice(name="MiniMax M2.7 (free)", value="minimax/minimax-m2.7:free"),
+    app_commands.Choice(name="MiniMax M3 (free)", value="minimax/minimax-m3:free"),
+]
+
+@bot.tree.command(name="disable_model", description="Disable a model from being used in /episode (Owner only).")
+@app_commands.describe(
+    model="Select the model to disable",
+    reason="The reason for disabling this model"
+)
+@app_commands.choices(model=MODEL_CHOICES)
+async def disable_model(
+    interaction: discord.Interaction,
+    model: app_commands.Choice[str],
+    reason: str = "Maintenance / Temporarily disabled."
+):
+    app_info = await bot.application_info()
+    if interaction.user.id != app_info.owner.id:
+        await interaction.response.send_message(
+            "Only the bot owner can use this command.", ephemeral=True
+        )
+        return
+
+    DISABLED_MODELS[model.value] = reason
+    await interaction.response.send_message(
+        f"Disabled model `{model.name}` (`{model.value}`).\n**Reason:** {reason}",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="enable_model", description="Re-enable a disabled model (Owner only).")
+@app_commands.describe(model="Select the model to enable")
+@app_commands.choices(model=MODEL_CHOICES)
+async def enable_model(
+    interaction: discord.Interaction,
+    model: app_commands.Choice[str]
+):
+    app_info = await bot.application_info()
+    if interaction.user.id != app_info.owner.id:
+        await interaction.response.send_message(
+            "Only the bot owner can use this command.", ephemeral=True
+        )
+        return
+
+    if model.value in DISABLED_MODELS:
+        del DISABLED_MODELS[model.value]
+        await interaction.response.send_message(
+            f"Re-enabled model `{model.name}` (`{model.value}`).",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"Model `{model.name}` is not currently disabled.",
+            ephemeral=True
+        )
+
 
 @bot.tree.command(name="queue", description="Check the current status of the episode queue.")
 async def show_queue(interaction: discord.Interaction):
@@ -145,53 +261,27 @@ async def run_episode_job(
     await interaction.edit_original_response(content="Generating episode script... [10%]")
 
     script_prompt = f"""
-    Write a short episode script.
+    Write a short parody episode script.
     Topic: {topic}
     
     Characters available: Fred, Kevin, Angry Fred
     Strict limit: Exactly {turns} total dialogue turns. Ensure every character speaks at least once.
-    Format strictly as:
+    Format strictly as (DO NOT put brackets around character names):
     Fred: [dialogue]
     Kevin: [dialogue]
     Angry Fred: [dialogue]
     """
 
-    safety_settings = [
-        types.SafetySetting(
-            category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-            threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
-        ),
-        types.SafetySetting(
-            category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-            threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
-        ),
-        types.SafetySetting(
-            category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-            threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
-        ),
-        types.SafetySetting(
-            category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-            threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
-        ),
-    ]
-
     try:
-        await interaction.edit_original_response(content="Requesting script from Gemini... [30%]")
-        response = await asyncio.to_thread(
-            gemini_client.models.generate_content,
-            model=chosen_model,
-            contents=script_prompt,
-            config=types.GenerateContentConfig(
-                safety_settings=safety_settings,
-                temperature=0.7,
-            ),
+        await interaction.edit_original_response(
+            content=f"Requesting script via {chosen_model}... [30%]"
         )
+        raw_script = await request_openrouter_script(script_prompt, chosen_model)
 
-        if not response.text:
-            await interaction.followup.send("Content blocked or empty response due to safety filters.")
+        if not raw_script:
+            await interaction.followup.send("Content blocked or empty response.")
             return
 
-        raw_script = response.text.strip()
     except Exception as e:
         await interaction.followup.send(f"Failed to generate script ({chosen_model}): {e}")
         return
@@ -203,7 +293,7 @@ async def run_episode_job(
 
     header_embed = discord.Embed(
         title=f"{EPISODE_EMOJI} EPISODE: {topic.upper()}",
-        description=f"*A {turns}-turn parody scene starring Fred, Kevin, and Evil Fred.*",
+        description=f"*A {turns}-turn parody scene starring Fred, Kevin, and Angry Fred.*",
         color=discord.Color.dark_embed(),
     )
     embeds.append(header_embed)
@@ -215,7 +305,8 @@ async def run_episode_job(
     for idx, line in enumerate(script_lines):
         match = re.match(r"^([^:]+)\s*:\s*(.*)$", line)
         if match:
-            speaker_key = match.group(1).strip()
+            # Strip brackets [ ] and extra whitespace from speaker name
+            speaker_key = re.sub(r"[\[\]]", "", match.group(1)).strip()
             dialogue = match.group(2).strip()
 
             char_data = CHARACTERS.get(
@@ -248,7 +339,9 @@ async def run_episode_job(
                 try:
                     audio_stream = await generate_tts_audio(dialogue, speaker_voice)
                     files.append(
-                        discord.File(audio_stream, filename=f"line_{line_count}_{speaker_key}.mp3")
+                        discord.File(
+                            audio_stream, filename=f"line_{line_count}_{speaker_key}.mp3"
+                        )
                     )
                 except Exception as tts_err:
                     print(f"TTS generation failed for line {line_count}: {tts_err}")
@@ -274,18 +367,10 @@ async def run_episode_job(
 @app_commands.describe(
     topic="The topic for the episode",
     turns="Number of dialogue turns (3 to 10)",
-    model="choose gemini models",
-    tts="Generate audio?",
+    model="Choose AI Model provider and version",
+    tts="Generate Edge-TTS audio?",
 )
-@app_commands.choices(
-    model=[
-        app_commands.Choice(name="Gemini 3.1 Flash Lite (Fast, ratelimited)", value="gemini-3.1-flash-lite"),
-        app_commands.Choice(name="Gemini 3.5 Flash Lite (Lightweight)", value="gemini-3.5-flash-lite"),
-        app_commands.Choice(name="Gemini 3.7 Flash", value="gemini-3.7-flash"),
-        app_commands.Choice(name="Gemini 3.5 Flash", value="gemini-3.5-flash"),
-        app_commands.Choice(name="Gemini 3.5", value="gemini-3.5-flash"),
-    ]
-)
+@app_commands.choices(model=MODEL_CHOICES)
 async def episode(
     interaction: discord.Interaction,
     topic: str,
@@ -293,21 +378,40 @@ async def episode(
     model: app_commands.Choice[str] = None,
     tts: bool = False,
 ):
-    if not gemini_client:
+    chosen_model = model.value if model else "gemini-3.5-flash-lite"
+
+    # Check if the requested model has been disabled by owner
+    if chosen_model in DISABLED_MODELS:
+        reason = DISABLED_MODELS[chosen_model]
+        await interaction.response.send_message(
+            f"The selected model (`{chosen_model}`) is currently disabled.\n**Reason:** {reason}",
+            ephemeral=True,
+        )
+        return
+
+    if chosen_model.startswith("gemini-") and not gemini_client:
         await interaction.response.send_message(
             "Gemini API key is missing.", ephemeral=True
         )
         return
 
+    if (
+        chosen_model.startswith("meta-llama") or chosen_model.startswith("openrouter") or chosen_model.startswith("minimax")
+    ) and not OPENROUTER_API_KEY:
+        await interaction.response.send_message(
+            "OpenRouter API key is missing in environment variables.", ephemeral=True
+        )
+        return
+
     await interaction.response.defer()
-    
+
     queue_position = bot.episode_queue.qsize() + 1
     if queue_position > 1:
-        await interaction.edit_original_response(content=f"Queued! Position in line: {queue_position - 1}")
+        await interaction.edit_original_response(
+            content=f"Queued! Position in line: {queue_position - 1}"
+        )
     else:
         await interaction.edit_original_response(content="Starting episode generation...")
-
-    chosen_model = model.value if model else "gemini-3.5-flash-lite"
 
     async def job(inter):
         await run_episode_job(inter, topic, turns, chosen_model, tts)
