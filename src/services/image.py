@@ -1,3 +1,5 @@
+## Image overlay system
+
 import io
 
 from PIL import Image, ImageSequence

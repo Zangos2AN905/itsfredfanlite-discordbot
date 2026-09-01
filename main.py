@@ -4,6 +4,7 @@ from src.config import DISCORD_TOKEN, GEMINI_API_KEY
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN or not GEMINI_API_KEY:
+        ## Fail with an error
         print("Error: DISCORD_TOKEN or GEMINI_API_KEY is missing from .env.")
     else:
         bot = ParodyBot()
